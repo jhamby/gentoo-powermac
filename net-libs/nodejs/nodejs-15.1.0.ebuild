@@ -24,7 +24,6 @@ REQUIRED_USE="
 
 RDEPEND="
 	>=dev-libs/libuv-1.37.0:=
-	>=net-dns/c-ares-1.16.0
 	>=net-libs/nghttp2-1.41.0
 	sys-libs/zlib
 	icu? ( >=dev-libs/icu-65:= )
@@ -41,8 +40,7 @@ DEPEND="
 	${RDEPEND}
 "
 PATCHES=(
-	"${FILESDIR}"/${PN}-10.3.0-global-npm-config.patch
-	"${FILESDIR}"/${PN}-14.15.0-ppc64-4k-pages.patch
+	"${FILESDIR}"/${PN}-15.1.0-ppc-fixes.patch
 )
 RESTRICT="test"
 S="${WORKDIR}/node-v${PV}"
@@ -100,7 +98,7 @@ src_configure() {
 	xdg_environment_reset
 
 	local myconf=(
-		--shared-cares --shared-libuv --shared-nghttp2 --shared-zlib
+		--shared-libuv --shared-nghttp2 --shared-zlib
 	)
 	use debug && myconf+=( --debug )
 	use icu && myconf+=( --with-intl=system-icu ) || myconf+=( --with-intl=none )
@@ -162,7 +160,7 @@ src_install() {
 		# Install bash completion for `npm`
 		# We need to temporarily replace default config path since
 		# npm otherwise tries to write outside of the sandbox
-		local npm_config="usr/$(get_libdir)/node_modules/npm/lib/config/core.js"
+		local npm_config="usr/$(get_libdir)/node_modules/npm/node_modules/resolve/lib/config/core.js"
 		sed -i -e "s|'/etc'|'${ED}/etc'|g" "${ED}/${npm_config}" || die
 		local tmp_npm_completion_file="$(TMPDIR="${T}" mktemp -t npm.XXXXXXXXXX)"
 		"${ED}/usr/bin/npm" completion > "${tmp_npm_completion_file}"
