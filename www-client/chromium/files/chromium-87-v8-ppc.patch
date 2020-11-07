@@ -1,0 +1,359 @@
+Fixes for older PowerPC targets.
+
+* PPC64 big-endian ELFv1 ABI uses function descriptors, like AIX.
+
+* Tell the code generator when we don't have the FP to int rounding
+instructions (added in Power ISA v2.03) by not enabling them in the
+MachineOperatorBuilder::Flags if we don't have a new enough CPU.
+
+* Change minimum page size to 4KB for PPC. 64KB physical pages are a
+newer feature that breaks some software, such as the nouveau driver.
+
+* Change PPC CPU detection to use getauxval() for glibc 2.16 and newer,
+and to correctly recognize all known Linux PowerPC platform types.
+Cell BE is identified as PPC_G5; other CPUs with AltiVec as PPC_G4.
+The new PPC_G3 type is used for all other CPUs without VMX/AltiVec.
+
+* Add VMX feature for future VMX/AltiVec code generation. VMX is a
+subset of VSX that's available on POWER6, G5, Cell, G4, and PA6T.
+The newer VSX feature is only available on POWER7 and newer CPUs.
+
+diff --git a/v8/src/base/build_config.h b/v8/src/base/build_config.h
+index ad287c9..555363d 100644
+--- a/v8/src/base/build_config.h
++++ b/v8/src/base/build_config.h
+@@ -203,11 +203,7 @@ constexpr int kReturnAddressStackSlotCount =
+     V8_TARGET_ARCH_STORES_RETURN_ADDRESS_ON_STACK ? 1 : 0;
+ 
+ // Number of bits to represent the page size for paged spaces.
+-#if defined(V8_TARGET_ARCH_PPC) || defined(V8_TARGET_ARCH_PPC64)
+-// PPC has large (64KB) physical pages.
+-const int kPageSizeBits = 19;
+-#else
++// Use 4KB for all targets. Not all PPC Linux kernels use 64KB pages.
+ const int kPageSizeBits = 18;
+-#endif
+ 
+ #endif  // V8_BASE_BUILD_CONFIG_H_
+diff --git a/v8/src/base/cpu.cc b/v8/src/base/cpu.cc
+index c0e9e70..271be73 100644
+--- a/v8/src/base/cpu.cc
++++ b/v8/src/base/cpu.cc
+@@ -735,8 +735,14 @@ CPU::CPU()
+ 
+ #ifndef USE_SIMULATOR
+ #if V8_OS_LINUX
++#if V8_GLIBC_PREREQ(2, 16)
++  // Read processor info from getauxval().
++  const char* auxv_cpu_type = reinterpret_cast<const char*>(getauxval(AT_PLATFORM));
++  icache_line_size_ = static_cast<int>(getauxval(AT_ICACHEBSIZE));
++  dcache_line_size_ = static_cast<int>(getauxval(AT_DCACHEBSIZE));
++#else
+   // Read processor info from /proc/self/auxv.
+-  char* auxv_cpu_type = nullptr;
++  const char* auxv_cpu_type = nullptr;
+   FILE* fp = fopen("/proc/self/auxv", "r");
+   if (fp != nullptr) {
+ #if V8_TARGET_ARCH_PPC64
+@@ -751,7 +757,7 @@ CPU::CPU()
+       }
+       switch (entry.a_type) {
+         case AT_PLATFORM:
+-          auxv_cpu_type = reinterpret_cast<char*>(entry.a_un.a_val);
++          auxv_cpu_type = reinterpret_cast<const char*>(entry.a_un.a_val);
+           break;
+         case AT_ICACHEBSIZE:
+           icache_line_size_ = entry.a_un.a_val;
+@@ -763,25 +769,36 @@ CPU::CPU()
+     }
+     fclose(fp);
+   }
++#endif  // V8_GLIBC_PREREQ(2, 16)
+ 
+   part_ = -1;
+   if (auxv_cpu_type) {
+-    if (strcmp(auxv_cpu_type, "power9") == 0) {
++    // use strncmp() in case "+" or "x" are added later.
++    if (strncmp(auxv_cpu_type, "power9", 6) == 0 ||
++        strncmp(auxv_cpu_type, "power1", 6) == 0) {     // e.g. "power10"
+       part_ = PPC_POWER9;
+-    } else if (strcmp(auxv_cpu_type, "power8") == 0) {
++    } else if (strncmp(auxv_cpu_type, "power8", 6) == 0) {
+       part_ = PPC_POWER8;
+-    } else if (strcmp(auxv_cpu_type, "power7") == 0) {
++    } else if (strncmp(auxv_cpu_type, "power7", 6) == 0) {  // or "power7+"
+       part_ = PPC_POWER7;
+-    } else if (strcmp(auxv_cpu_type, "power6") == 0) {
++    } else if (strncmp(auxv_cpu_type, "power6", 6) == 0) {  // or "power6x"
+       part_ = PPC_POWER6;
++    // use exact strcmp() from here.
++    } else if (strcmp(auxv_cpu_type, "power5+") == 0) {     // adds FP rounding
++      part_ = PPC_POWER5_PLUS;
+     } else if (strcmp(auxv_cpu_type, "power5") == 0) {
+       part_ = PPC_POWER5;
+-    } else if (strcmp(auxv_cpu_type, "ppc970") == 0) {
++    } else if (strcmp(auxv_cpu_type, "ppc970") == 0 ||
++               strcmp(auxv_cpu_type, "ppc-cell-be") == 0) {
+       part_ = PPC_G5;
+-    } else if (strcmp(auxv_cpu_type, "ppc7450") == 0) {
++    } else if (strcmp(auxv_cpu_type, "ppc7450") == 0 ||
++               strcmp(auxv_cpu_type, "ppc7400") == 0 ||
++               strcmp(auxv_cpu_type, "ppce6500") == 0) {
+       part_ = PPC_G4;
+     } else if (strcmp(auxv_cpu_type, "pa6t") == 0) {
+       part_ = PPC_PA6T;
++    } else {
++      part_ = PPC_G3;
+     }
+   }
+ 
+diff --git a/v8/src/base/cpu.h b/v8/src/base/cpu.h
+index 8cec23c..85d7828 100644
+--- a/v8/src/base/cpu.h
++++ b/v8/src/base/cpu.h
+@@ -66,10 +66,12 @@ class V8_BASE_EXPORT CPU final {
+   // PPC-specific part codes
+   enum {
+     PPC_POWER5,
++    PPC_POWER5_PLUS,
+     PPC_POWER6,
+     PPC_POWER7,
+     PPC_POWER8,
+     PPC_POWER9,
++    PPC_G3,
+     PPC_G4,
+     PPC_G5,
+     PPC_PA6T
+diff --git a/v8/src/codegen/cpu-features.h b/v8/src/codegen/cpu-features.h
+index eef98f7..73a8ed2 100644
+--- a/v8/src/codegen/cpu-features.h
++++ b/v8/src/codegen/cpu-features.h
+@@ -51,11 +51,12 @@ enum CpuFeature {
+   MIPS_SIMD,  // MSA instructions
+ 
+ #elif V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+-  FPU,
++  FP_ROUND_TO_INT,
+   FPR_GPR_MOV,
+   LWSYNC,
+   ISELECT,
+   VSX,
++  VMX,
+   MODULO,
+ 
+ #elif V8_TARGET_ARCH_S390X
+diff --git a/v8/src/codegen/ppc/assembler-ppc.cc b/v8/src/codegen/ppc/assembler-ppc.cc
+index 37a53b4..9ecff6a 100644
+--- a/v8/src/codegen/ppc/assembler-ppc.cc
++++ b/v8/src/codegen/ppc/assembler-ppc.cc
+@@ -61,47 +61,52 @@ void CpuFeatures::ProbeImpl(bool cross_compile) {
+   // Only use statically determined features for cross compile (snapshot).
+   if (cross_compile) return;
+ 
+-// Detect whether frim instruction is supported (POWER5+)
+-// For now we will just check for processors we know do not
+-// support it
+ #ifndef USE_SIMULATOR
+   // Probe for additional features at runtime.
+   base::CPU cpu;
+-  if (cpu.part() == base::CPU::PPC_POWER9) {
++  switch (cpu.part()) {
++  case base::CPU::PPC_POWER9:
+     supported_ |= (1u << MODULO);
+-  }
++    // fallthrough
++
++  case base::CPU::PPC_POWER8:
+ #if V8_TARGET_ARCH_PPC64
+-  if (cpu.part() == base::CPU::PPC_POWER8) {
+     supported_ |= (1u << FPR_GPR_MOV);
+-  }
+ #endif
+-  if (cpu.part() == base::CPU::PPC_POWER6 ||
+-      cpu.part() == base::CPU::PPC_POWER7 ||
+-      cpu.part() == base::CPU::PPC_POWER8) {
+-    supported_ |= (1u << LWSYNC);
+-  }
+-  if (cpu.part() == base::CPU::PPC_POWER7 ||
+-      cpu.part() == base::CPU::PPC_POWER8) {
++    // fallthrough
++
++  case base::CPU::PPC_POWER7:
+     supported_ |= (1u << ISELECT);
+     supported_ |= (1u << VSX);
++    // fallthrough
++
++  case base::CPU::PPC_POWER6:
++    supported_ |= (1u << LWSYNC);
++    supported_ |= (1u << VMX);
++    // fallthrough
++
++  case base::CPU::PPC_POWER5_PLUS:
++  case base::CPU::PPC_PA6T:
++    supported_ |= (1u << FP_ROUND_TO_INT);
++    break;
+   }
+-#if V8_OS_LINUX
+-  if (!(cpu.part() == base::CPU::PPC_G5 || cpu.part() == base::CPU::PPC_G4)) {
+-    // Assume support
+-    supported_ |= (1u << FPU);
++  // Add VMX/AltiVec feature for the non-IBM CPUs that have it.
++  if (cpu.part() == base::CPU::PPC_PA6T ||
++      cpu.part() == base::CPU::PPC_G5 ||
++      cpu.part() == base::CPU::PPC_G4) {
++    supported_ |= (1u << VMX);
+   }
++#if V8_OS_LINUX
+   if (cpu.icache_line_size() != base::CPU::UNKNOWN_CACHE_LINE_SIZE) {
+     icache_line_size_ = cpu.icache_line_size();
+   }
+-#elif V8_OS_AIX
+-  // Assume support FP support and default cache line size
+-  supported_ |= (1u << FPU);
+ #endif
+ #else  // Simulator
+-  supported_ |= (1u << FPU);
++  supported_ |= (1u << FP_ROUND_TO_INT);
+   supported_ |= (1u << LWSYNC);
+   supported_ |= (1u << ISELECT);
+   supported_ |= (1u << VSX);
++  supported_ |= (1u << VMX);
+   supported_ |= (1u << MODULO);
+ #if V8_TARGET_ARCH_PPC64
+   supported_ |= (1u << FPR_GPR_MOV);
+@@ -122,11 +127,12 @@ void CpuFeatures::PrintTarget() {
+ }
+ 
+ void CpuFeatures::PrintFeatures() {
+-  printf("FPU=%d\n", CpuFeatures::IsSupported(FPU));
++  printf("FP_ROUND_TO_INT=%d\n", CpuFeatures::IsSupported(FP_ROUND_TO_INT));
+   printf("FPR_GPR_MOV=%d\n", CpuFeatures::IsSupported(FPR_GPR_MOV));
+   printf("LWSYNC=%d\n", CpuFeatures::IsSupported(LWSYNC));
+   printf("ISELECT=%d\n", CpuFeatures::IsSupported(ISELECT));
+   printf("VSX=%d\n", CpuFeatures::IsSupported(VSX));
++  printf("VMX=%d\n", CpuFeatures::IsSupported(VMX));
+   printf("MODULO=%d\n", CpuFeatures::IsSupported(MODULO));
+ }
+ 
+@@ -1747,6 +1753,11 @@ void Assembler::fabs(const DoubleRegister frt, const DoubleRegister frb,
+   emit(EXT4 | FABS | frt.code() * B21 | frb.code() * B11 | rc);
+ }
+ 
++void Assembler::fnabs(const DoubleRegister frt, const DoubleRegister frb,
++                     RCBit rc) {
++  emit(EXT4 | FNABS | frt.code() * B21 | frb.code() * B11 | rc);
++}
++
+ void Assembler::fmadd(const DoubleRegister frt, const DoubleRegister fra,
+                       const DoubleRegister frc, const DoubleRegister frb,
+                       RCBit rc) {
+diff --git a/v8/src/codegen/ppc/assembler-ppc.h b/v8/src/codegen/ppc/assembler-ppc.h
+index f26a3c8..f2cc865 100644
+--- a/v8/src/codegen/ppc/assembler-ppc.h
++++ b/v8/src/codegen/ppc/assembler-ppc.h
+@@ -1008,6 +1008,8 @@ class Assembler : public AssemblerBase {
+              RCBit rc = LeaveRC);
+   void fabs(const DoubleRegister frt, const DoubleRegister frb,
+             RCBit rc = LeaveRC);
++  void fnabs(const DoubleRegister frt, const DoubleRegister frb,
++            RCBit rc = LeaveRC);
+   void fmadd(const DoubleRegister frt, const DoubleRegister fra,
+              const DoubleRegister frc, const DoubleRegister frb,
+              RCBit rc = LeaveRC);
+diff --git a/v8/src/common/globals.h b/v8/src/common/globals.h
+index 0e9d815..88646f7 100644
+--- a/v8/src/common/globals.h
++++ b/v8/src/common/globals.h
+@@ -202,7 +202,7 @@ constexpr bool kPlatformRequiresCodeRange = true;
+ #if (V8_HOST_ARCH_PPC || V8_HOST_ARCH_PPC64) && \
+     (V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64) && V8_OS_LINUX
+ constexpr size_t kMaximalCodeRangeSize = 512 * MB;
+-constexpr size_t kMinExpectedOSPageSize = 64 * KB;  // OS page on PPC Linux
++constexpr size_t kMinExpectedOSPageSize = 4 * KB;  // min OS page size
+ #elif V8_TARGET_ARCH_ARM64
+ constexpr size_t kMaximalCodeRangeSize = 128 * MB;
+ constexpr size_t kMinExpectedOSPageSize = 4 * KB;  // OS page.
+@@ -225,7 +225,7 @@ constexpr intptr_t kIntptrSignBit = 0x80000000;
+ constexpr bool kPlatformRequiresCodeRange = false;
+ constexpr size_t kMaximalCodeRangeSize = 0 * MB;
+ constexpr size_t kMinimumCodeRangeSize = 0 * MB;
+-constexpr size_t kMinExpectedOSPageSize = 64 * KB;  // OS page on PPC Linux
++constexpr size_t kMinExpectedOSPageSize = 4 * KB;  // min OS page size
+ #elif V8_TARGET_ARCH_MIPS
+ constexpr bool kPlatformRequiresCodeRange = false;
+ constexpr size_t kMaximalCodeRangeSize = 2048LL * MB;
+diff --git a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+index 0c61821..9f7ece0 100644
+--- a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
++++ b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+@@ -2463,16 +2463,21 @@ void InstructionSelector::VisitF64x2Pmax(Node* node) { UNIMPLEMENTED(); }
+ // static
+ MachineOperatorBuilder::Flags
+ InstructionSelector::SupportedMachineOperatorFlags() {
+-  return MachineOperatorBuilder::kFloat32RoundDown |
+-         MachineOperatorBuilder::kFloat64RoundDown |
+-         MachineOperatorBuilder::kFloat32RoundUp |
+-         MachineOperatorBuilder::kFloat64RoundUp |
+-         MachineOperatorBuilder::kFloat32RoundTruncate |
+-         MachineOperatorBuilder::kFloat64RoundTruncate |
+-         MachineOperatorBuilder::kFloat64RoundTiesAway |
+-         MachineOperatorBuilder::kWord32Popcnt |
+-         MachineOperatorBuilder::kWord64Popcnt;
++  MachineOperatorBuilder::Flags flags = MachineOperatorBuilder::kWord32Popcnt;
++#if V8_TARGET_ARCH_PPC64
++  flags |= MachineOperatorBuilder::kWord64Popcnt;
++#endif
++  if (CpuFeatures::IsSupported(FP_ROUND_TO_INT)) {
++    flags |= MachineOperatorBuilder::kFloat32RoundDown |
++             MachineOperatorBuilder::kFloat64RoundDown |
++             MachineOperatorBuilder::kFloat32RoundUp |
++             MachineOperatorBuilder::kFloat64RoundUp |
++             MachineOperatorBuilder::kFloat32RoundTruncate |
++             MachineOperatorBuilder::kFloat64RoundTruncate |
++             MachineOperatorBuilder::kFloat64RoundTiesAway;
++  }
+   // We omit kWord32ShiftIsSafe as s[rl]w use 0x3F as a mask rather than 0x1F.
++  return flags;
+ }
+ 
+ // static
+diff --git a/v8/src/heap/base/asm/ppc/push_registers_asm.cc b/v8/src/heap/base/asm/ppc/push_registers_asm.cc
+index c0e6c0b..d9edc2a 100644
+--- a/v8/src/heap/base/asm/ppc/push_registers_asm.cc
++++ b/v8/src/heap/base/asm/ppc/push_registers_asm.cc
+@@ -33,7 +33,7 @@ asm(
+     // At anytime, SP (r1) needs to be multiple of 16 (i.e. 16-aligned).
+     "  mflr 0                                          \n"
+     "  std 0, 16(1)                                    \n"
+-#if defined(_AIX)
++#if ABI_USES_FUNCTION_DESCRIPTORS
+     "  std 2, 40(1)                                    \n"
+ #else
+     "  std 2, 24(1)                                    \n"
+@@ -61,7 +61,7 @@ asm(
+     // Pass 2nd parameter (r4) unchanged (StackVisitor*).
+     // Save 3rd parameter (r5; IterateStackCallback).
+     "  mr 6, 5                                         \n"
+-#if defined(_AIX)
++#if ABI_USES_FUNCTION_DESCRIPTORS
+     // Set up TOC for callee.
+     "  ld 2,8(5)                                       \n"
+     // AIX uses function descriptors, which means that
+@@ -72,7 +72,7 @@ asm(
+ #endif
+     // Pass 3rd parameter as sp (stack pointer).
+     "  mr 5, 1                                         \n"
+-#if !defined(_AIX)
++#if !ABI_USES_FUNCTION_DESCRIPTORS
+     // Set up r12 to be equal to the callee address (in order for TOC
+     // relocation). Only needed on LE Linux.
+     "  mr 12, 6                                        \n"
+@@ -85,7 +85,7 @@ asm(
+     // Restore lr.
+     "  ld 0, 16(1)                                     \n"
+     "  mtlr  0                                         \n"
+-#if defined(_AIX)
++#if ABI_USES_FUNCTION_DESCRIPTORS
+     // Restore TOC pointer.
+     "  ld 2, 40(1)                                     \n"
+ #else
