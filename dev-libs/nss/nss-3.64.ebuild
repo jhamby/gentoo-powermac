@@ -1,4 +1,4 @@
-# Copyright 1999-2020 Gentoo Authors
+# Copyright 1999-2021 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 EAPI=7
@@ -9,13 +9,13 @@ NSPR_VER="4.29"
 RTM_NAME="NSS_${PV//./_}_RTM"
 
 DESCRIPTION="Mozilla's Network Security Services library that implements PKI support"
-HOMEPAGE="https://www.mozilla.org/projects/security/pki/nss/"
+HOMEPAGE="https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS"
 SRC_URI="https://archive.mozilla.org/pub/security/nss/releases/${RTM_NAME}/src/${P}.tar.gz
-	cacert? ( https://dev.gentoo.org/~axs/distfiles/${PN}-cacert-class1-class3.patch )"
+	cacert? ( https://dev.gentoo.org/~whissi/dist/ca-certificates/nss-cacert-class1-class3-r1.patch )"
 
 LICENSE="|| ( MPL-2.0 GPL-2 LGPL-2.1 )"
 SLOT="0"
-KEYWORDS="~alpha ~amd64 ~arm ~arm64 ~hppa ~ia64 ~m68k ~mips ~ppc ~ppc64 ~s390 ~sparc ~x86 ~amd64-linux ~x86-linux ~x86-macos ~sparc-solaris ~x64-solaris ~x86-solaris"
+KEYWORDS="~alpha ~amd64 ~arm ~arm64 ~hppa ~ia64 ~m68k ~mips ~ppc ~ppc64 ~s390 ~sparc ~x86 ~amd64-linux ~x86-linux ~x64-solaris ~x86-solaris"
 IUSE="cacert utils cpu_flags_ppc_vsx2"
 # pkg-config called by nss-config -> virtual/pkgconfig in RDEPEND
 RDEPEND="
@@ -42,13 +42,11 @@ PATCHES=(
 )
 
 src_prepare() {
-	if use cacert ; then #521462
-		PATCHES+=(
-			"${DISTDIR}/${PN}-cacert-class1-class3.patch"
-		)
-	fi
-
 	default
+
+	if use cacert ; then
+		eapply -p2 "${DISTDIR}"/nss-cacert-class1-class3-r1.patch
+	fi
 
 	pushd coreconf >/dev/null || die
 	# hack nspr paths
@@ -82,7 +80,7 @@ src_prepare() {
 
 	multilib_copy_sources
 
-	# Local diff: comment out strip-flags
+	strip-flags
 }
 
 multilib_src_configure() {
@@ -94,11 +92,12 @@ nssarch() {
 	# Most of the arches are the same as $ARCH
 	local t=${1:-${CHOST}}
 	case ${t} in
-		aarch64*)echo "aarch64";;
-		hppa*)   echo "parisc";;
-		i?86*)   echo "i686";;
-		x86_64*) echo "x86_64";;
-		*)       tc-arch ${t};;
+		*86*-pc-solaris2*) echo "i86pc"   ;;
+		aarch64*)          echo "aarch64" ;;
+		hppa*)             echo "parisc"  ;;
+		i?86*)             echo "i686"    ;;
+		x86_64*)           echo "x86_64"  ;;
+		*)                 tc-arch ${t}   ;;
 	esac
 }
 
